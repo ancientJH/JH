@@ -1,0 +1,21 @@
+
+function assemble_global_r(q::Vector, cellvalues, dh::DofHandler, material::Material, states, states_old, tag::String, store::Bool=true)
+    nbase = getnbasefunctions(cellvalues);
+    Re = zeros(nbase);
+    R = zeros(ndofs(dh));
+    @inbounds for (i, cell) in enumerate(CellIterator(dh))
+        reinit!(cellvalues, cell);
+        fill!(Re, 0);
+        eldofs = celldofs(cell);
+        qe = q[eldofs];
+        state = @view states[:, i];
+        state_old = @view states_old[:, i];
+        if tag == "u"
+            assemble_residual_u!(Re, cellvalues, qe, material, state, state_old, store);
+        elseif tag == "ϕ"
+            assemble_residual_ϕ!(Re, cellvalues, qe, material, state, state_old, store);
+        end
+        R[eldofs] += Re;
+    end
+    return R
+end;

@@ -1,0 +1,335 @@
+function solve_lbfgs_coupled!(
+    # 输入/输出：完整解向量和有限元状态
+    u::Vector{Float64},
+    ϕ::Vector{Float64},
+    states, # 当前状态变量
+    # 输入：其他有限元上下文
+    states_old, # 上一步的状态变量
+    dh_u::DofHandler,
+    dh_ϕ::DofHandler,
+    ch_u::ConstraintHandler,
+    ch_ϕ::ConstraintHandler,
+    dh_mixed::MixedDofHandler, # 混合自由度处理器
+    cellvalues_u::CellVectorValues,   # 位移场单元插值
+    cellvalues_ϕ::CellScalarValues,   # 相场单元插值
+    grid::Grid,
+    material::Material,
+    solver_options::SolverState, # 求解器参数
+    current_load::Float64,     # 当前载荷参数
+    ref_norm_Ru::Float64,      # 参考残差范数 (位移)
+    ref_norm_Rϕ::Float64       # 参考残差范数 (相场)
+)
+
+    # L-BFGS 参数 (参考MATLAB: m=6, H0重置的alpha_min=1e-3)
+    mem_size::Int = 6 # L-BFGS 存储的历史对数量
+    alpha_min_H0_reset::Float64 = 1e-3 # H0 重置的最小步长阈值
+
+    # 从 solver_options 获取最大迭代次数和相对容差因子
+    # 收敛容差 (绝对范数)
+    tol_Ru_abs = solver_options.TOL_u * ref_norm_Ru
+    tol_Rϕ_abs = solver_options.TOL_ϕ * ref_norm_Rϕ
+
+    # 获取活动自由度
+    active_dofs_u = Ferrite.free_dofs(ch_u)
+    active_dofs_ϕ = Ferrite.free_dofs(ch_ϕ)
+    num_active_u = length(active_dofs_u)
+    num_active_ϕ = length(active_dofs_ϕ)
+    num_active_total = num_active_u + num_active_ϕ
+
+    # L-BFGS 历史记录 (针对活动自由度)
+    S_hist = zeros(Float64, num_active_total, mem_size) # s_k = x_{k+1} - x_k
+    Y_hist = zeros(Float64, num_active_total, mem_size) # y_k = g_{k+1} - g_k
+    rho_hist = zeros(Float64, mem_size)                 # 1.0 / dot(s_k, y_k)
+    num_stored = 0 # 已存储的历史对数量
+    next_pair_idx = 1 # 循环缓冲区的索引 (1 到 mem_size)
+
+    # 当前活动解 (Xk) 和梯度 (Gk)
+    Xk_active = zeros(Float64, num_active_total)
+    Gk_active = zeros(Float64, num_active_total) # 合并的活动梯度
+    Gk_u_active_view = view(Gk_active, 1:num_active_u)
+    Gk_ϕ_active_view = view(Gk_active, (num_active_u+1):num_active_total)
+
+    # X_{k+1} 和 G_{k+1} 活动部分的临时存储
+    X_next_active = similar(Xk_active)
+    G_next_active = similar(Gk_active)
+    G_next_u_active_view = view(G_next_active, 1:num_active_u)
+    G_next_ϕ_active_view = view(G_next_active, (num_active_u+1):num_active_total)
+
+    # --- 初始 H0 (活动自由度的刚度矩阵 K) 及其逆的作用 ---
+    local H0_inv_action::Function
+    K_u_pattern = create_sparsity_pattern(dh_u)
+    K_ϕ_pattern = create_sparsity_pattern(dh_ϕ)
+
+    # 修改开始：定义一个新的函数 create_H0_inv_operator 来创建并返回 H0 逆算子
+    function create_H0_inv_operator()
+        fill!(K_u_pattern.nzval, 0.0)
+        fill!(K_ϕ_pattern.nzval, 0.0)
+
+        # K_u_full 和 K_ϕ_full 使用 solve_lbfgs_coupled! 当前作用域的 u, ϕ, states 等变量
+        K_u_full = assemble_global_Ku(u, cellvalues_u, K_u_pattern, dh_u, material, states, states_old)
+        K_ϕ_full = assemble_global_Kϕ(ϕ, cellvalues_ϕ, K_ϕ_pattern, dh_ϕ, material, states, states_old)
+
+        # 这些活动子矩阵将被返回的匿名函数捕获
+        local_K_uu_active = K_u_full[active_dofs_u, active_dofs_u]
+        local_K_ϕϕ_active = K_ϕ_full[active_dofs_ϕ, active_dofs_ϕ]
+        
+        # 返回的函数是 H0 逆算子本身
+        return function(v_in::Vector{Float64})
+            res_out = zeros(Float64, num_active_total) # num_active_total, num_active_u 等从外部作用域捕获
+            if num_active_u > 0
+                res_out[1:num_active_u] = local_K_uu_active \ v_in[1:num_active_u]
+            end
+            if num_active_ϕ > 0
+                res_out[(num_active_u+1):end] = local_K_ϕϕ_active \ v_in[(num_active_u+1):end]
+            end
+            return res_out
+        end
+    end
+    # 修改结束：移除旧的 update_H0_inv_action! 定义
+
+    # 初始 H0_inv_action 的赋值
+    H0_inv_action = create_H0_inv_operator()
+    # 修改结束：替换旧的 update_H0_inv_action!() 调用
+
+    # --- 初始梯度 Gk ---
+    r_u_full = assemble_global_r(u, cellvalues_u, dh_u, material, states, states_old, "u")
+    r_ϕ_full = assemble_global_r(ϕ, cellvalues_ϕ, dh_ϕ, material, states, states_old, "ϕ")
+
+    Gk_u_active_view .= r_u_full[active_dofs_u]
+    Gk_ϕ_active_view .= r_ϕ_full[active_dofs_ϕ]
+
+    iters_done = 0
+    for iter = 1:solver_options.nitr_outer
+        iters_done = iter
+
+        Xk_active[1:num_active_u] .= u[active_dofs_u]
+        Xk_active[(num_active_u+1):end] .= ϕ[active_dofs_ϕ]
+
+        local search_dir_active::Vector{Float64}
+        if iter == 1 || num_stored == 0
+            search_dir_active = -H0_inv_action(Gk_active)
+        else
+            search_dir_active = lbfgs_two_loop_recursion(
+                Gk_active, S_hist, Y_hist, rho_hist,
+                num_stored, next_pair_idx, mem_size,
+                H0_inv_action
+            )
+        end
+
+        alpha = lbfgs_line_search_matlab_style!(
+            states,
+            u, ϕ,
+            view(search_dir_active, 1:num_active_u),
+            view(search_dir_active, (num_active_u+1):num_active_total),
+            ref_norm_Ru, ref_norm_Rϕ,
+            dh_u, dh_ϕ, ch_u, ch_ϕ, cellvalues_u, cellvalues_ϕ, # Restored names
+            grid, material, states_old, current_load,
+            active_dofs_u, active_dofs_ϕ, solver_options
+        )
+        println("alpha = $alpha")
+
+        u[active_dofs_u] .+= alpha .* view(search_dir_active, 1:num_active_u)
+        ϕ[active_dofs_ϕ] .+= alpha .* view(search_dir_active, (num_active_u+1):num_active_total)
+
+
+        r_u_new = assemble_global_r(u, cellvalues_u, dh_u, material, states, states_old, "u")
+        r_ϕ_new = assemble_global_r(ϕ, cellvalues_ϕ, dh_ϕ, material, states, states_old, "ϕ")
+
+        G_next_u_active_view .= r_u_new[active_dofs_u]
+        G_next_ϕ_active_view .= r_ϕ_new[active_dofs_ϕ]
+
+        X_next_active[1:num_active_u] .= u[active_dofs_u]
+        X_next_active[(num_active_u+1):end] .= ϕ[active_dofs_ϕ]
+
+        norm_G_next_u = norm(G_next_u_active_view)
+        norm_G_next_ϕ = norm(G_next_ϕ_active_view)
+
+        println("load = $current_load, iter = $iter, norm_ru=$norm_G_next_u, norm_rϕ=$norm_G_next_ϕ, Ru_first=$ref_norm_Ru, Rϕ_first=$ref_norm_Rϕ ")
+        if norm_G_next_u <= tol_Ru_abs && norm_G_next_ϕ <= tol_Rϕ_abs
+            break
+        end
+
+        sk_vec = X_next_active - Xk_active
+        yk_vec = G_next_active - Gk_active
+        skyk_dot = dot(sk_vec, yk_vec)
+
+        if skyk_dot > 1e-12
+            S_hist[:, next_pair_idx] .= sk_vec
+            Y_hist[:, next_pair_idx] .= yk_vec
+            rho_hist[next_pair_idx] = 1.0 / skyk_dot
+
+            next_pair_idx = mod1(next_pair_idx + 1, mem_size)
+            if num_stored < mem_size
+                num_stored += 1
+            end
+        end
+
+        Gk_active .= G_next_active
+
+        if iter % mem_size == 0 || (alpha < alpha_min_H0_reset && iter > 1)
+            # 修改：调用新的创建函数并重新赋值
+            H0_inv_action = create_H0_inv_operator()
+            num_stored = 0
+            next_pair_idx = 1
+        end
+
+        if iter == solver_options.nitr_outer
+            @warn("L-BFGS: Maximum iterations ($(solver_options.nitr_outer)) reached without convergence for current_load = $current_load")
+        end
+    end
+
+    return u, ϕ, iters_done
+end
+
+function lbfgs_two_loop_recursion(
+    Gk_active::Vector{Float64},         # Current concatenated active gradient
+    S_hist::Matrix{Float64},            # History of s_k = x_{k+1} - x_k
+    Y_hist::Matrix{Float64},            # History of y_k = g_{k+1} - g_k
+    rho_hist::Vector{Float64},          # History of 1.0 / dot(s_k, y_k)
+    num_stored_pairs::Int,              # Number of pairs currently in history (<= m_memory)
+    current_newest_idx::Int,          # Index in circular buffer of the newest pair
+    m_memory::Int,                      # Max number of pairs to store
+    H0_inv_action::Function             # Action of initial inverse Hessian H0_inv
+)::Vector{Float64}
+
+    q = copy(Gk_active)
+    alpha_cache = zeros(Float64, m_memory)
+
+    # First loop: q = q - alpha_i * y_i
+    # Iterate from newest pair to oldest
+    # current_newest_idx points to the slot *containing* the newest pair
+    # (Adjusting from previous version where it pointed to *next* slot)
+    for i = 0:(num_stored_pairs-1)
+        phys_idx = mod1(current_newest_idx - i, m_memory) # phys_idx for (i+1)-th newest pair
+        # if rho_hist[phys_idx] == 0.0 continue # Should be caught by skyk > 0 check
+        
+        alpha_cache[phys_idx] = rho_hist[phys_idx] * dot(S_hist[:, phys_idx], q)
+        q .-= alpha_cache[phys_idx] .* Y_hist[:, phys_idx]
+    end
+
+    # Apply initial inverse Hessian: r = H0_inv * q
+    r = H0_inv_action(q)
+
+    # Second loop: r = r + (alpha_i - beta_i) * s_i
+    # Iterate from oldest pair to newest
+    for i = (num_stored_pairs-1):-1:0
+        phys_idx = mod1(current_newest_idx - i, m_memory) # phys_idx for (i+1)-th newest pair
+        # if rho_hist[phys_idx] == 0.0 continue
+
+        beta = rho_hist[phys_idx] * dot(Y_hist[:, phys_idx], r)
+        r .+= S_hist[:, phys_idx] .* (alpha_cache[phys_idx] - beta)
+    end
+    return -r # Search direction dk
+end
+
+function lbfgs_line_search_matlab_style!(
+    # 输入/输出: states_current (将被修改并作为最优alpha处的states返回)
+    states_current,
+    # 输入: 当前完整解向量 (xk)
+    u_k::Vector{Float64},
+    ϕ_k::Vector{Float64},
+    # 输入: 活动搜索方向 (dk)
+    dk_u_active::AbstractVector{Float64},
+    dk_ϕ_active::AbstractVector{Float64},
+    # 输入: 参考残差范数
+    ref_norm_Ru::Float64,
+    ref_norm_Rϕ::Float64,
+    # 输入: 有限元上下文
+    dh_u::DofHandler,
+    dh_ϕ::DofHandler,
+    ch_u::ConstraintHandler,
+    ch_ϕ::ConstraintHandler,
+    cellvalues_u::CellVectorValues,   # Restored name
+    cellvalues_ϕ::CellScalarValues,   # Restored name
+    grid::Grid,
+    material::Material,
+    states_old, # 上一步的状态变量 (在此载荷步中固定)
+    current_load::Float64,
+    # 输入: 活动自由度索引
+    active_dofs_u::Vector{Int},
+    active_dofs_ϕ::Vector{Int},
+    # 输入: L-BFGS 参数 (来自MATLAB的行搜索部分)
+    solver_options # 包含 nitr_inner, NewtonTOL_inner (在此函数中解释为行搜索参数)
+)
+
+    max_ls_iter = 5
+    ls_tol = 0.1
+    alpha = 1.0
+
+    num_active_u = length(active_dofs_u)
+    num_active_ϕ = length(active_dofs_ϕ)
+
+    u_trial = copy(u_k)
+    ϕ_trial = copy(ϕ_k)
+
+    G_u_trial_active = zeros(Float64, num_active_u)
+    G_ϕ_trial_active = zeros(Float64, num_active_ϕ)
+
+    local K_uu_trial_active::SparseMatrixCSC{Float64,Int}
+    local K_ϕϕ_trial_active::SparseMatrixCSC{Float64,Int}
+
+    states_at_best_alpha = deepcopy(states_current)
+
+    for ls_iter = 1:max_ls_iter
+        u_trial[active_dofs_u] = u_k[active_dofs_u] .+ alpha .* dk_u_active
+        ϕ_trial[active_dofs_ϕ] = ϕ_k[active_dofs_ϕ] .+ alpha .* dk_ϕ_active
+        apply!(u_trial, ch_u)
+        apply!(ϕ_trial, ch_ϕ)
+
+        copyto!(states_current, states_at_best_alpha)
+
+        r_u_full_trial = assemble_global_r(u_trial, cellvalues_u, dh_u, material, states_current, states_old, "u") # Restored name
+        r_ϕ_full_trial = assemble_global_r(ϕ_trial, cellvalues_ϕ, dh_ϕ, material, states_current, states_old, "ϕ") # Restored name
+
+        G_u_trial_active .= r_u_full_trial[active_dofs_u]
+        G_ϕ_trial_active .= r_ϕ_full_trial[active_dofs_ϕ]
+
+        K_u_pattern_ls = create_sparsity_pattern(dh_u)
+        K_ϕ_pattern_ls = create_sparsity_pattern(dh_ϕ)
+
+        K_u_full_trial, _ = assemble_global(u_trial, cellvalues_u, K_u_pattern_ls, dh_u, material, states_current, states_old, "u")    # Restored name
+        K_ϕ_full_trial, _ = assemble_global(ϕ_trial, cellvalues_ϕ, K_ϕ_pattern_ls, dh_ϕ, material, states_current, states_old, "ϕ") # Restored name
+
+        K_uu_trial_active = K_u_full_trial[active_dofs_u, active_dofs_u]
+        K_ϕϕ_trial_active = K_ϕ_full_trial[active_dofs_ϕ, active_dofs_ϕ]
+
+        df_dalpha_u_term = 0.0
+        df_dalpha_ϕ_term = 0.0
+        d2f_dalpha2_u_term = 0.0
+        d2f_dalpha2_ϕ_term = 0.0
+
+        if num_active_u > 0
+            Kdk_u = K_uu_trial_active * dk_u_active
+            df_dalpha_u_term = dot(G_u_trial_active, Kdk_u)
+            d2f_dalpha2_u_term = dot(Kdk_u, Kdk_u)
+        end
+        if num_active_ϕ > 0
+            Kdk_ϕ = K_ϕϕ_trial_active * dk_ϕ_active
+            df_dalpha_ϕ_term = dot(G_ϕ_trial_active, Kdk_ϕ)
+            d2f_dalpha2_ϕ_term = dot(Kdk_ϕ, Kdk_ϕ)
+        end
+
+        df_dalpha = 2 * df_dalpha_u_term / (ref_norm_Ru^2 + eps(Float64)) +
+                      2 * df_dalpha_ϕ_term / (ref_norm_Rϕ^2 + eps(Float64))
+
+        d2f_dalpha2 = 2 * d2f_dalpha2_u_term / (ref_norm_Ru^2 + eps(Float64)) +
+                        2 * d2f_dalpha2_ϕ_term / (ref_norm_Rϕ^2 + eps(Float64))
+
+        if abs(d2f_dalpha2) < 1e-9
+            d2f_dalpha2 = 1e-9 * sign(d2f_dalpha2)
+            if abs(d2f_dalpha2) < 1e-9; d2f_dalpha2 = 1e-9; end
+        end
+
+        alpha_new = alpha - df_dalpha / d2f_dalpha2
+        copyto!(states_at_best_alpha, states_current)
+
+        if abs(df_dalpha) < ls_tol
+            alpha = alpha_new
+            break
+        end
+        alpha = alpha_new
+    end
+    copyto!(states_current, states_at_best_alpha)
+
+    return alpha
+end
